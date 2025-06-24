@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QAbstractItemView, QProgressBar, QSplitter,
     QGroupBox, QCheckBox, QSpinBox, QSlider
 )
-from PyQt6.QtGui import QPixmap, QIcon, QMovie, QPainter
+from PyQt6.QtGui import QPixmap, QIcon, QMovie, QPainter, QImage
 from PyQt6.QtCore import (Qt, QSize, QThreadPool, QRunnable, pyqtSignal, 
                           QObject, QTimer, QMutex, pyqtSlot)
 
@@ -49,7 +49,8 @@ SORTING_DISPLAY_NAMES = [
 PREVIEW_WIDTH = 200
 PREVIEW_HEIGHT = 200
 THUMBNAIL_SIZE = 150
-MAX_WORKERS = 4
+MAX_WORKERS = min(8, os.cpu_count() or 4)
+
 
 # Sorting algos: Bubble Sort, Merge Sort, Quick Sort, Radix Sort (Brightness, color), Custom
 # Sorting criteria: Dominant Color, Brightness, Aspect-Ratio, File Size, Resolution, Sharpness, Color Variance, [AI-Based Sorting]
@@ -213,6 +214,9 @@ class WorkerSignals(QObject):
     progress = pyqtSignal(int)              # progress percentage
     error = pyqtSignal(str, str)            # path, error_message
 
+    sorted_result = pyqtSignal(list)  # sorted list of images
+    thumb_ready = pyqtSignal(str, QIcon) 
+
 
 class ImageAnalysisWorker(QRunnable):
     """Worker for analyzing images in a separate thread"""
@@ -230,7 +234,12 @@ class ImageAnalysisWorker(QRunnable):
                 return
             
             metrics = ImageProcessor.analyze_image(self.path)
+            thumb = QImage(self.path)
+            thumb  = thumb.scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT,
+                          Qt.AspectRatioMode.KeepAspectRatio,
+                          Qt.TransformationMode.SmoothTransformation)
             self.signals.result.emit(self.path, metrics)
+            self.signals.thumb_ready.emit(self.path, QIcon(QPixmap.fromImage(thumb)))
 
         except Exception as e:
             error_msg = f"Failed to process {self.path}: {str(e)}"
@@ -241,6 +250,77 @@ class ImageAnalysisWorker(QRunnable):
 
     def cancel(self):
         self.is_cancelled = True
+
+class SortingWorker(QRunnable):
+    """Worker for sorting images in background thread"""
+    
+    def __init__(self, image_list: List[Tuple[str, ImageMetrics]], criteria_index: int, reverse: bool):
+        super().__init__()
+        self.image_list = image_list.copy()  # Make a copy to avoid thread issues
+        self.criteria_index = criteria_index
+        self.reverse = reverse
+        self.signals = WorkerSignals()
+        self.is_cancelled = False
+    
+    @pyqtSlot()
+    def run(self):
+        try:
+            if self.is_cancelled:
+                return
+            
+            criteria = SORTING_CRITERIA[self.criteria_index]
+            
+            def get_sort_key(item: Tuple[str, ImageMetrics]) -> Any:
+                _, metrics = item
+                
+                if criteria == "dominant_color":
+                    # Sort by luminance of dominant color
+                    r, g, b = metrics.dominant_color
+                    return 0.299 * r + 0.587 * g + 0.114 * b
+                elif criteria == "resolution":
+                    width, height = metrics.resolution
+                    return width * height
+                elif criteria == "color_variance":
+                    return sum(metrics.color_variance)
+                else:
+                    return getattr(metrics, criteria, 0)
+            
+            # Perform the sort
+            sorted_list = sorted(self.image_list, key=get_sort_key, reverse=self.reverse)
+            
+            if not self.is_cancelled:
+                self.signals.sorted_result.emit(sorted_list)
+                
+        except Exception as e:
+            logger.error(f"Error in sorting worker: {e}")
+            self.signals.error.emit("sorting", str(e))
+    
+    def cancel(self):
+        self.is_cancelled = True
+
+class ThumbnailLoaderWorker(QRunnable):
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+        self.signals = WorkerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            pixmap = QPixmap(self.path)
+            if pixmap.isNull():
+                pixmap = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+                pixmap.fill(Qt.GlobalColor.lightGray)
+
+            icon = QIcon(pixmap.scaled(
+                PREVIEW_WIDTH, PREVIEW_HEIGHT,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+
+            self.signals.thumb_ready.emit(self.path, icon)
+        except Exception as e:
+            logger.error(f"Thumbnail loading failed for {self.path}: {e}")
+
 
 class ThumbnailCache:
     """Simple thumbnail cache to improve performance"""
@@ -284,6 +364,8 @@ class ImageSorterApp(QWidget):
         self.workers: List[ImageAnalysisWorker] = []
         self.pending_tasks = 0
         self.mutex = QMutex()
+
+        self.item_lookup: Dict[str, QListWidgetItem] = {}
 
         self.thumbnail_cache = ThumbnailCache()
 
@@ -544,6 +626,8 @@ class ImageSorterApp(QWidget):
             worker.signals.result.connect(self.on_image_analyzed)
             worker.signals.finished.connect(self.on_worker_finished)
             worker.signals.error.connect(self.on_worker_error)
+
+            worker.signals.thumb_ready.connect(self.on_thumb_ready)
             
             self.workers.append(worker)
             self.threadpool.start(worker)
@@ -580,15 +664,17 @@ class ImageSorterApp(QWidget):
         logger.error(f"Error processing {path}: {error}")
 
     def add_image_to_list(self, path: str):
-        """Add image to the list widget"""
-        try:
-            icon = self.get_thumbnail_icon(path)
-            item = QListWidgetItem(icon, os.path.basename(path))
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(f"Path: {path}")
-            self.list_widget.addItem(item)
-        except Exception as e:
-            logger.error(f"Failed to add image to list: {e}")
+        # placeholder (light-grey square)
+        placeholder = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        placeholder.fill(Qt.GlobalColor.lightGray)
+
+        icon = self.get_thumbnail_icon(path) or QIcon(placeholder)
+        item = QListWidgetItem(icon, os.path.basename(path))
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        item.setToolTip(path)
+
+        self.list_widget.addItem(item)
+        self.item_lookup[path] = item 
 
     def populate_image_list(self):
         """Populate the list widget with all images"""
@@ -652,33 +738,66 @@ class ImageSorterApp(QWidget):
         criteria = SORTING_CRITERIA[self.sorting_criteria_index]
         logger.info(f"Sorting by {criteria} (reverse: {self.reverse_sort})")
         
-        def get_sort_key(item: Tuple[str, ImageMetrics]) -> Any:
-            _, metrics = item
-            
-            if criteria == "dominant_color":
-                # Sort by luminance of dominant color
-                r, g, b = metrics.dominant_color
-                return 0.299 * r + 0.587 * g + 0.114 * b
-            elif criteria == "resolution":
-                width, height = metrics.resolution
-                return width * height
-            elif criteria == "color_variance":
-                return sum(metrics.color_variance)
-            else:
-                return getattr(metrics, criteria, 0)
-        
-        try:
-            self.image_list.sort(key=get_sort_key, reverse=self.reverse_sort)
-            
-            # Refresh the list widget
-            self.list_widget.clear()
-            self.populate_image_list()
-            
-            logger.info("Images sorted successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to sort images: {e}")
-            QMessageBox.critical(self, "Sort Error", f"Failed to sort images: {str(e)}")
+        self.update_ui_state(True)
+        self.status_label.setText("Sorting images...")
+
+        worker = SortingWorker(
+            self.image_list, 
+            self.sorting_criteria_index, 
+            self.reverse_sort
+        )
+
+        worker.signals.sorted_result.connect(self.on_sorting_finished)
+        worker.signals.error.connect(self.on_sorting_error)
+
+        self.workers.append(worker)
+        self.threadpool.start(worker)
+
+    def on_thumb_ready(self, path: str, icon: QIcon):
+        """Handle thumbnail ready signal"""
+        if item := self.item_lookup.get(path):
+            item.setIcon(icon)
+
+    def on_sorting_finished(self, sorted_list):
+        # 1. update the *data* first
+        self.image_list = sorted_list
+
+        # 2. rebuild the view quickly with cheap placeholders
+        self.item_lookup.clear()              
+        self.list_widget.setUpdatesEnabled(False)
+        self.list_widget.clear()
+
+        for path, _ in sorted_list:
+            # Use cached thumbnail or a placeholder here:
+            icon = self.get_thumbnail_icon(path)
+            item = QListWidgetItem(icon, os.path.basename(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.list_widget.addItem(item)
+            self.item_lookup[path] = item
+        self.list_widget.setUpdatesEnabled(True)
+
+        # 3. tell the user we’re done
+        self.status_label.setText("Sorting complete")
+        self.update_ui_state(False)           
+
+        self.load_thumbnails_async([path for path, _ in sorted_list])
+
+    def load_thumbnails_async(self, paths: List[str]):
+        # Cancel previous thumbnail workers if needed
+        self.cancel_workers()
+
+        for path in paths:
+            worker = ThumbnailLoaderWorker(path)  # You need to create this worker
+            worker.signals.thumb_ready.connect(self.on_thumb_ready)
+            self.workers.append(worker)
+            self.threadpool.start(worker)
+
+    def on_sorting_error(self, path: str, error: str):
+        """Handle sorting error"""
+        logger.error(f"Error during sorting: {error}")
+        QMessageBox.critical(self, "Sorting Error", f"Failed to sort images:\n{error}")
+        self.update_ui_state(False)
+        self.status_label.setText("Sorting failed")
 
     def export_selected(self):
         """Export selected images to a folder"""
