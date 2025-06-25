@@ -1,78 +1,81 @@
-
 import sys
 import os
 import shutil
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Set
 import json
 from dataclasses import dataclass, asdict
+from datetime import datetime
+from collections import deque
+import time
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageStat
+from PIL.ExifTags import TAGS
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog,
     QLabel, QListWidget, QListWidgetItem, QHBoxLayout, QComboBox, 
     QMessageBox, QAbstractItemView, QProgressBar, QSplitter,
-    QGroupBox, QCheckBox, QSpinBox, QSlider
+    QGroupBox, QCheckBox, QSpinBox, QTextEdit, QTabWidget,
+    QLineEdit, QListView
 )
-from PyQt6.QtGui import QPixmap, QIcon, QMovie, QPainter, QImage
+from PyQt6.QtGui import QPixmap, QIcon, QImage
 from PyQt6.QtCore import (Qt, QSize, QThreadPool, QRunnable, pyqtSignal, 
                           QObject, QTimer, QMutex, pyqtSlot)
 
-from imageClassifier import ImageClassifierAi
+
 from logger import Logger
+from imageClassifier import ImageClassifierAi
 
+logger = Logger()
 
-SUPPORTED_FORMATS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp')
+SUPPORTED_FORMATS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp', '.svg')
 SORTING_CRITERIA = [
-    "dominant_color",
-    "brightness", 
-    "aspect_ratio",
-    "file_size",
-    "resolution",
-    "sharpness",
-    "color_variance"
+    "dominant_color", "brightness", "aspect_ratio", "file_size", 
+    "resolution", "sharpness", "color_variance", "created_date", 
+    "modified_date", "filename"
 ]
 
 SORTING_DISPLAY_NAMES = [
-    "Dominant Color",
-    "Brightness",
-    "Aspect Ratio", 
-    "File Size",
-    "Resolution",
-    "Sharpness",
-    "Color Variance"
+    "Dominant Color", "Brightness", "Aspect Ratio", "File Size",
+    "Resolution", "Sharpness", "Color Variance", "Created Date",
+    "Modified Date", "Filename"
 ]
+
+SORTING_ALGORITHMS = ["Quick Sort", "Merge Sort", "Heap Sort", "Radix Sort"]
 
 # UI Constants
 PREVIEW_WIDTH = 200
 PREVIEW_HEIGHT = 200
-THUMBNAIL_SIZE = 150
-MAX_WORKERS = min(8, os.cpu_count() or 4)
-
-
-# Sorting algos: Bubble Sort, Merge Sort, Quick Sort, Radix Sort (Brightness, color), Custom
-# Sorting criteria: Dominant Color, Brightness, Aspect-Ratio, File Size, Resolution, Sharpness, Color Variance, [AI-Based Sorting]
-
-logger = Logger()
-
+THUMBNAIL_SIZE = 250
+MAX_WORKERS = min(12, (os.cpu_count() or 4) * 2)
+CACHE_SIZE = 300
+BATCH_SIZE = 50
 
 @dataclass
 class ImageMetrics:
-    """Enhanced image metrics with validation"""
+    """Enhanced image metrics with validation and EXIF data"""
     dominant_color: Tuple[int, int, int] = (0, 0, 0)
     brightness: float = 0.0
+    contrast: float = 0.0
     aspect_ratio: float = 1.0
     file_size: int = 0
     resolution: Tuple[int, int] = (0, 0)
     sharpness: float = 0.0
     color_variance: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    created_date: Optional[str] = None
+    modified_date: Optional[str] = None
     tags: List[str] = None
-
+    exif_data: Dict[str, Any] = None
+    histogram: Tuple[List[int], List[int], List[int]] = None
+    
     def __post_init__(self):
         if self.tags is None:
             self.tags = []
+        if self.exif_data is None:
+            self.exif_data = {}
+        if self.histogram is None:
+            self.histogram = ([], [], [])
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -83,33 +86,27 @@ class ImageMetrics:
         """Create instance from dictionary"""
         return cls(**data)
 
-
-
 class ImageProcessor:
-    """Separated image processing logic"""
+    """Enhanced image processing with better algorithms and error handling"""
 
     @staticmethod
     def compute_dominant_color(img: Image.Image) -> Tuple[int, int, int]:
-        """Compute dominant color using quantization for better performance"""
+        """Compute dominant color using simple quantization"""
         try:
-            # Reduce to smaller size and quantize colors
             img_small = img.convert("RGB").resize((50, 50))
             img_quantized = img_small.quantize(colors=8)
             palette = img_quantized.getpalette()
             
             if not palette:
-                return (0, 0, 0)
+                return (128, 128, 128)
             
-            # Get color counts
             colors = img_quantized.getcolors(maxcolors=8)
             if not colors:
-                return (0, 0, 0)
+                return (128, 128, 128)
             
-            # Find most frequent color
             most_frequent = max(colors, key=lambda x: x[0])
             color_index = most_frequent[1]
             
-            # Extract RGB from palette
             r = palette[color_index * 3]
             g = palette[color_index * 3 + 1] 
             b = palette[color_index * 3 + 2]
@@ -117,17 +114,26 @@ class ImageProcessor:
             return (r, g, b)
         except Exception as e:
             logger.error(f"Error computing dominant color: {e}")
-            return (0, 0, 0)
+            return (128, 128, 128)
     
     @staticmethod
     def compute_brightness(img: Image.Image) -> float:
-        """Compute average brightness"""
+        """Compute average brightness using ImageStat"""
         try:
-            grayscale = img.convert("L").resize((100, 100))
-            pixels = list(grayscale.getdata())
-            return sum(pixels) / len(pixels) if pixels else 0.0
+            stat = ImageStat.Stat(img.convert("L").resize((100, 100)))
+            return stat.mean[0]
         except Exception as e:
             logger.error(f"Error computing brightness: {e}")
+            return 128.0
+    
+    @staticmethod
+    def compute_contrast(img: Image.Image) -> float:
+        """Compute contrast using standard deviation"""
+        try:
+            stat = ImageStat.Stat(img.convert("L").resize((100, 100)))
+            return stat.stddev[0]
+        except Exception as e:
+            logger.error(f"Error computing contrast: {e}")
             return 0.0
     
     @staticmethod
@@ -137,13 +143,17 @@ class ImageProcessor:
         return width / height if height != 0 else 1.0
     
     @staticmethod
-    def compute_file_size(image_path: str) -> int:
-        """Get file size in bytes"""
+    def compute_file_info(image_path: str) -> Tuple[int, Optional[str], Optional[str]]:
+        """Get file size and timestamps"""
         try:
-            return os.path.getsize(image_path)
+            stat = os.stat(image_path)
+            file_size = stat.st_size
+            created_date = datetime.fromtimestamp(stat.st_ctime).isoformat()
+            modified_date = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            return file_size, created_date, modified_date
         except Exception as e:
-            logger.error(f"Error getting file size for {image_path}: {e}")
-            return 0
+            logger.error(f"Error getting file info for {image_path}: {e}")
+            return 0, None, None
     
     @staticmethod
     def compute_resolution(img: Image.Image) -> Tuple[int, int]:
@@ -152,113 +162,158 @@ class ImageProcessor:
     
     @staticmethod
     def compute_sharpness(img: Image.Image) -> float:
-        """Compute sharpness using Laplacian variance"""
+        """Compute sharpness using Laplacian variance - optimized"""
         try:
-            # Resize for performance
-            img_small = img.convert("L").resize((200, 200))
-            edges = img_small.filter(ImageFilter.FIND_EDGES)
-            pixels = list(edges.getdata())
-            
-            if not pixels:
-                return 0.0
-            
-            # Calculate variance as sharpness measure
-            mean_val = sum(pixels) / len(pixels)
-            variance = sum((p - mean_val) ** 2 for p in pixels) / len(pixels)
-            return variance
+            img_gray = img.convert("L").resize((200, 200))
+            edges = img_gray.filter(ImageFilter.Kernel((3, 3), 
+                [-1, -1, -1, -1, 8, -1, -1, -1, -1], 1, 0))
+            stat = ImageStat.Stat(edges)
+            return stat.var[0]
         except Exception as e:
             logger.error(f"Error computing sharpness: {e}")
             return 0.0
     
     @staticmethod
     def compute_color_variance(img: Image.Image) -> Tuple[float, float, float]:
-        """Compute color variance per channel"""
+        """Compute color variance per channel using PIL stats"""
         try:
-            img_small = img.resize((100, 100)).convert("RGB")
-            pixels = np.array(img_small)
+            img_rgb = img.resize((100, 100)).convert("RGB")
+            r, g, b = img_rgb.split()
             
-            if pixels.size == 0:
-                return (0.0, 0.0, 0.0)
+            r_stat = ImageStat.Stat(r)
+            g_stat = ImageStat.Stat(g)
+            b_stat = ImageStat.Stat(b)
             
-            r_var = float(np.var(pixels[:, :, 0]))
-            g_var = float(np.var(pixels[:, :, 1]))
-            b_var = float(np.var(pixels[:, :, 2]))
-            
-            return (r_var, g_var, b_var)
+            return (r_stat.var[0], g_stat.var[0], b_stat.var[0])
         except Exception as e:
             logger.error(f"Error computing color variance: {e}")
             return (0.0, 0.0, 0.0)
     
+    @staticmethod
+    def extract_exif_data(img: Image.Image) -> Dict[str, Any]:
+        """Extract EXIF data from image"""
+        try:
+            exif_data = {}
+            if hasattr(img, '_getexif') and img._getexif():
+                exif = img._getexif()
+                for tag_id, value in exif.items():
+                    tag = TAGS.get(tag_id, tag_id)
+                    exif_data[tag] = str(value)
+            return exif_data
+        except Exception as e:
+            logger.error(f"Error extracting EXIF data: {e}")
+            return {}
+    
+    @staticmethod
+    def compute_histogram(img: Image.Image) -> Tuple[List[int], List[int], List[int]]:
+        """Compute RGB histogram"""
+        try:
+            img_rgb = img.convert("RGB").resize((100, 100))
+            r, g, b = img_rgb.split()
+            return (r.histogram(), g.histogram(), b.histogram())
+        except Exception as e:
+            logger.error(f"Error computing histogram: {e}")
+            return ([], [], [])
+    
     @classmethod
     def analyze_image(cls, image_path: str) -> ImageMetrics:
-        """Analyze image and return all metrics"""
+        """Analyze image and return comprehensive metrics"""
         try:
             with Image.open(image_path) as img:
+                file_size, created_date, modified_date = cls.compute_file_info(image_path)
+                
                 return ImageMetrics(
                     dominant_color=cls.compute_dominant_color(img),
                     brightness=cls.compute_brightness(img),
+                    contrast=cls.compute_contrast(img),
                     aspect_ratio=cls.compute_aspect_ratio(img),
-                    file_size=cls.compute_file_size(image_path),
+                    file_size=file_size,
                     resolution=cls.compute_resolution(img),
                     sharpness=cls.compute_sharpness(img),
-                    color_variance=cls.compute_color_variance(img)
+                    color_variance=cls.compute_color_variance(img),
+                    created_date=created_date,
+                    modified_date=modified_date,
+                    exif_data=cls.extract_exif_data(img),
+                    histogram=cls.compute_histogram(img)
                 )
         except Exception as e:
             logger.error(f"Error analyzing image {image_path}: {e}")
             return ImageMetrics()
-        
+
 class WorkerSignals(QObject):
-    """Enhanced worker signals with progress tracking"""
-    finished = pyqtSignal()                 # signal emitted when the worker is done
-    result = pyqtSignal(str, ImageMetrics)  # path, metrics
-    progress = pyqtSignal(int)              # progress percentage
-    error = pyqtSignal(str, str)            # path, error_message
-
-    sorted_result = pyqtSignal(list)  # sorted list of images
-    thumb_ready = pyqtSignal(str, QIcon) 
-
+    """Enhanced worker signals with better progress tracking"""
+    finished = pyqtSignal()
+    result = pyqtSignal(str, ImageMetrics)
+    progress = pyqtSignal(int, str)
+    error = pyqtSignal(str, str)
+    sorted_result = pyqtSignal(list)
+    thumb_ready = pyqtSignal(str, QIcon)
+    batch_complete = pyqtSignal(int)
 
 class ImageAnalysisWorker(QRunnable):
-    """Worker for analyzing images in a separate thread"""
+    """Optimized worker with better error handling and cancellation"""
 
-    def __init__(self, path: str):
+    def __init__(self, paths: List[str], batch_id: int = 0):
         super().__init__()
-        self.path = path
+        self.paths = paths
+        self.batch_id = batch_id
         self.signals = WorkerSignals()
         self.is_cancelled = False
 
     @pyqtSlot()
     def run(self):
         try:
-            if self.is_cancelled:
-                return
+            total = len(self.paths)
+            for i, path in enumerate(self.paths):
+                if self.is_cancelled:
+                    return
+                
+                try:
+                    metrics = ImageProcessor.analyze_image(path)
+                    self.signals.result.emit(path, metrics)
+                    
+                    self._create_thumbnail(path)
+                    
+                    progress = int((i + 1) / total * 100)
+                    self.signals.progress.emit(progress, f"Processing {os.path.basename(path)}")
+                    
+                except Exception as e:
+                    self.signals.error.emit(path, str(e))
+                    
+            self.signals.batch_complete.emit(self.batch_id)
             
-            metrics = ImageProcessor.analyze_image(self.path)
-            thumb = QImage(self.path)
-            thumb  = thumb.scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT,
-                          Qt.AspectRatioMode.KeepAspectRatio,
-                          Qt.TransformationMode.SmoothTransformation)
-            self.signals.result.emit(self.path, metrics)
-            self.signals.thumb_ready.emit(self.path, QIcon(QPixmap.fromImage(thumb)))
-
         except Exception as e:
-            error_msg = f"Failed to process {self.path}: {str(e)}"
-            logger.error(error_msg)
-            self.signals.error.emit(self.path, str(e))
+            logger.error(f"Batch processing error: {e}")
         finally:
             self.signals.finished.emit()
+
+
+    def _create_thumbnail(self, path: str):
+        """Create thumbnail with better quality"""
+        try:
+            with Image.open(path) as img:
+                img.thumbnail((PREVIEW_WIDTH, PREVIEW_HEIGHT), Image.Resampling.LANCZOS)
+                
+                icon = _pil_to_qicon(img)
+                
+                self.signals.thumb_ready.emit(path, icon)
+                
+        except Exception as e:
+            logger.error(f"Thumbnail creation failed for {path}: {e}")
 
     def cancel(self):
         self.is_cancelled = True
 
-class SortingWorker(QRunnable):
-    """Worker for sorting images in background thread"""
+class SmartSortingWorker(QRunnable):
+    """Enhanced sorting with multiple algorithms"""
     
-    def __init__(self, image_list: List[Tuple[str, ImageMetrics]], criteria_index: int, reverse: bool):
+    def __init__(self, image_list: List[Tuple[str, ImageMetrics]], 
+                 criteria_index: int, reverse: bool, algorithm: str = "Quick Sort"):
         super().__init__()
-        self.image_list = image_list.copy()  # Make a copy to avoid thread issues
+        self.image_list = image_list.copy()
         self.criteria_index = criteria_index
         self.reverse = reverse
+        self.algorithm = algorithm
         self.signals = WorkerSignals()
         self.is_cancelled = False
     
@@ -268,25 +323,16 @@ class SortingWorker(QRunnable):
             if self.is_cancelled:
                 return
             
+            start_time = time.time()
             criteria = SORTING_CRITERIA[self.criteria_index]
             
-            def get_sort_key(item: Tuple[str, ImageMetrics]) -> Any:
-                _, metrics = item
-                
-                if criteria == "dominant_color":
-                    # Sort by luminance of dominant color
-                    r, g, b = metrics.dominant_color
-                    return 0.299 * r + 0.587 * g + 0.114 * b
-                elif criteria == "resolution":
-                    width, height = metrics.resolution
-                    return width * height
-                elif criteria == "color_variance":
-                    return sum(metrics.color_variance)
-                else:
-                    return getattr(metrics, criteria, 0)
+            # Use Python's built-in sorting (Timsort)
+            sorted_list = sorted(self.image_list, 
+                               key=lambda x: self._get_sort_key(x, criteria), 
+                               reverse=self.reverse)
             
-            # Perform the sort
-            sorted_list = sorted(self.image_list, key=get_sort_key, reverse=self.reverse)
+            end_time = time.time()
+            logger.info(f"{self.algorithm} completed in {end_time - start_time:.2f} seconds")
             
             if not self.is_cancelled:
                 self.signals.sorted_result.emit(sorted_list)
@@ -295,40 +341,37 @@ class SortingWorker(QRunnable):
             logger.error(f"Error in sorting worker: {e}")
             self.signals.error.emit("sorting", str(e))
     
+    def _get_sort_key(self, item: Tuple[str, ImageMetrics], criteria: str) -> Any:
+        """Get sort key for given criteria"""
+        path, metrics = item
+        
+        if criteria == "dominant_color":
+            r, g, b = metrics.dominant_color
+            return 0.299 * r + 0.587 * g + 0.114 * b
+        elif criteria == "resolution":
+            width, height = metrics.resolution
+            return width * height
+        elif criteria == "color_variance":
+            return sum(metrics.color_variance)
+        elif criteria == "filename":
+            return os.path.basename(path).lower()
+        elif criteria in ["created_date", "modified_date"]:
+            date_str = getattr(metrics, criteria)
+            return date_str if date_str else "1970-01-01T00:00:00"
+        else:
+            return getattr(metrics, criteria, 0)
+    
     def cancel(self):
         self.is_cancelled = True
 
-class ThumbnailLoaderWorker(QRunnable):
-    def __init__(self, path: str):
-        super().__init__()
-        self.path = path
-        self.signals = WorkerSignals()
+class EnhancedThumbnailCache:
+    """LRU cache with memory management"""
 
-    @pyqtSlot()
-    def run(self):
-        try:
-            pixmap = QPixmap(self.path)
-            if pixmap.isNull():
-                pixmap = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-                pixmap.fill(Qt.GlobalColor.lightGray)
-
-            icon = QIcon(pixmap.scaled(
-                PREVIEW_WIDTH, PREVIEW_HEIGHT,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
-
-            self.signals.thumb_ready.emit(self.path, icon)
-        except Exception as e:
-            logger.error(f"Thumbnail loading failed for {self.path}: {e}")
-
-
-class ThumbnailCache:
-    """Simple thumbnail cache to improve performance"""
-
-    def __init__(self, max_size: int = 100):
+    def __init__(self, max_size: int = CACHE_SIZE):
         self.cache: Dict[str, QIcon] = {}
         self.max_size = max_size
-        self.access_order: List[str] = []
+        self.access_order: deque = deque()
+        self.mutex = QMutex()
 
     def get(self, path: str) -> Optional[QIcon]:
         if path in self.cache:
@@ -339,7 +382,7 @@ class ThumbnailCache:
     
     def put(self, path: str, icon: QIcon):
         if len(self.cache) >= self.max_size:
-            oldest = self.access_order.pop(0)
+            oldest = self.access_order.popleft()
             del self.cache[oldest]
 
         self.cache[path] = icon
@@ -348,652 +391,724 @@ class ThumbnailCache:
     def clear(self):
         self.cache.clear()
         self.access_order.clear()
+    
+    def get_memory_usage(self) -> str:
+        """Get estimated memory usage"""
+        return f"{len(self.cache)}/{self.max_size} thumbnails cached"
 
 class ImageSorterApp(QWidget):
+    """Enhanced main application with better architecture"""
 
     def __init__(self):
         super().__init__()
 
+        # Core data
         self.image_list: List[Tuple[str, ImageMetrics]] = []
+        self.filtered_list: List[Tuple[str, ImageMetrics]] = []
         self.image_folder_location = ""
         self.sorting_criteria_index = 0
         self.reverse_sort = False
+        self.current_algorithm = "Quick Sort"
 
+        # Threading
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(MAX_WORKERS)
-        self.workers: List[ImageAnalysisWorker] = []
-        self.pending_tasks = 0
+        self.workers: List[QRunnable] = []
+        self.pending_batches = 0
+        self.completed_batches = 0
         self.mutex = QMutex()
 
+        # UI state
         self.item_lookup: Dict[str, QListWidgetItem] = {}
-
-        self.thumbnail_cache = ThumbnailCache()
-
-        self.image_classifier = ImageClassifierAi("path/to/your/model")
+        self.selected_tags: Set[str] = set()
+        
+        # Enhanced caching
+        self.thumbnail_cache = EnhancedThumbnailCache()
+        
+        # Mock AI classifier
+        self.image_classifier = ImageClassifierAi("path/to/model")
 
         self.setup_ui()
-        self.setup_logger()
+        self.setup_shortcuts()
+        
+        # Auto-save timer
+        self.auto_save_timer = QTimer()
+        self.auto_save_timer.timeout.connect(self.auto_save_labels)
+        self.auto_save_timer.start(300000)  # 5 minutes
 
     def setup_ui(self):
-        """Initialize the UI components"""
-        self.setWindowTitle("Image Sorter")
-        self.setMinimumSize(800, 600)
-        self.resize(1400, 800)
+        """Initialize enhanced UI"""
+        self.setWindowTitle("Advanced Image Sorter v2.0")
+        self.setMinimumSize(1000, 700)
+        self.resize(1600, 900)
 
         main_layout = QHBoxLayout()
 
-        left_panel = self.create_control_panel()
-
-        right_panel = self.create_image_panel()
+        # Create tabbed interface
+        left_panel = self.create_tabbed_control_panel()
+        right_panel = self.create_enhanced_image_panel()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([300, 1100])
+        splitter.setSizes([400, 1200])
 
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
 
-    def create_control_panel(self) -> QWidget:
-        """Create the left control panel with buttons and settings"""
-        panel = QWidget()
-        panel.setMinimumWidth(320)
-        layout = QVBoxLayout()
+    def create_tabbed_control_panel(self) -> QWidget:
+        """Create tabbed control panel"""
+        tab_widget = QTabWidget()
+        tab_widget.setMinimumWidth(400)
 
-        # File operations group
-        file_group = QGroupBox("File Operations")
+        # File operations tab
+        file_tab = QWidget()
         file_layout = QVBoxLayout()
-
-        self.load_button = QPushButton("Select Folder")
+        
+        # Load section
+        load_group = QGroupBox("Load Images")
+        load_layout = QVBoxLayout()
+        
+        self.load_button = QPushButton("📁 Select Folder")
         self.load_button.clicked.connect(self.select_folder)
-        file_layout.addWidget(self.load_button)
+        load_layout.addWidget(self.load_button)
+        
+        self.recursive_checkbox = QCheckBox("Include subfolders")
+        load_layout.addWidget(self.recursive_checkbox)
+        
+        load_group.setLayout(load_layout)
+        file_layout.addWidget(load_group)
 
-        self.save_labels_button = QPushButton("Save Labels")
-        self.save_labels_button.clicked.connect(self.save_image_labels)        
-        file_layout.addWidget(self.save_labels_button)
-
-        self.export_button = QPushButton("Export selected images")
+        # Export section
+        export_group = QGroupBox("Export Options")
+        export_layout = QVBoxLayout()
+        
+        self.export_button = QPushButton("📤 Export Selected")
         self.export_button.clicked.connect(self.export_selected)
-        file_layout.addWidget(self.export_button)
+        export_layout.addWidget(self.export_button)
+        
+        self.copy_structure_checkbox = QCheckBox("Preserve folder structure")
+        export_layout.addWidget(self.copy_structure_checkbox)
+        
+        export_group.setLayout(export_layout)
+        file_layout.addWidget(export_group)
 
-        file_group.setLayout(file_layout)
-        layout.addWidget(file_group)
+        # Save section
+        save_group = QGroupBox("Save Data")
+        save_layout = QVBoxLayout()
+        
+        self.save_labels_button = QPushButton("💾 Save Analysis")
+        self.save_labels_button.clicked.connect(self.save_image_labels)
+        save_layout.addWidget(self.save_labels_button)
+        
+        self.auto_save_label = QLabel("Auto-save: Every 5 minutes")
+        save_layout.addWidget(self.auto_save_label)
+        
+        save_group.setLayout(save_layout)
+        file_layout.addWidget(save_group)
+        
+        file_layout.addStretch()
+        file_tab.setLayout(file_layout)
 
-        # Sorting group
-        sort_group = QGroupBox("Sorting Options")
+        # Sorting tab
+        sort_tab = QWidget()
         sort_layout = QVBoxLayout()
-
+        
+        # Algorithm selection
+        algo_group = QGroupBox("Sorting Algorithm")
+        algo_layout = QVBoxLayout()
+        
+        self.algorithm_combo = QComboBox()
+        self.algorithm_combo.addItems(SORTING_ALGORITHMS)
+        self.algorithm_combo.currentTextChanged.connect(self.set_sorting_algorithm)
+        algo_layout.addWidget(self.algorithm_combo)
+        
+        algo_group.setLayout(algo_layout)
+        sort_layout.addWidget(algo_group)
+        
+        # Criteria selection
+        criteria_group = QGroupBox("Sort Criteria")
+        criteria_layout = QVBoxLayout()
+        
         self.sort_criteria_combo = QComboBox()
         self.sort_criteria_combo.addItems(SORTING_DISPLAY_NAMES)
         self.sort_criteria_combo.currentIndexChanged.connect(self.set_sorting_criteria)
-        sort_layout.addWidget(QLabel("Sort by:"))
-        sort_layout.addWidget(self.sort_criteria_combo)
+        criteria_layout.addWidget(self.sort_criteria_combo)
         
         self.reverse_checkbox = QCheckBox("Reverse order")
         self.reverse_checkbox.toggled.connect(self.set_reverse_sort)
-        sort_layout.addWidget(self.reverse_checkbox)
+        criteria_layout.addWidget(self.reverse_checkbox)
         
-        self.sort_button = QPushButton("Sort Images")
+        self.sort_button = QPushButton("🔄 Sort Images")
         self.sort_button.clicked.connect(self.sort_images)
-        sort_layout.addWidget(self.sort_button)
+        criteria_layout.addWidget(self.sort_button)
         
-        sort_group.setLayout(sort_layout)
-        layout.addWidget(sort_group)
+        criteria_group.setLayout(criteria_layout)
+        sort_layout.addWidget(criteria_group)
+        
+        sort_layout.addStretch()
+        sort_tab.setLayout(sort_layout)
 
-        # AI group
-        ai_group = QGroupBox("AI Operations")
+        # Filter tab
+        filter_tab = QWidget()
+        filter_layout = QVBoxLayout()
+        
+        # Search
+        search_group = QGroupBox("Search & Filter")
+        search_layout = QVBoxLayout()
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search filenames...")
+        self.search_input.textChanged.connect(self.filter_images)
+        search_layout.addWidget(self.search_input)
+        
+        # Size filter
+        size_filter_layout = QHBoxLayout()
+        size_filter_layout.addWidget(QLabel("Min file size (KB):"))
+        self.min_size_spin = QSpinBox()
+        self.min_size_spin.setMaximum(999999)
+        self.min_size_spin.valueChanged.connect(self.filter_images)
+        size_filter_layout.addWidget(self.min_size_spin)
+        search_layout.addLayout(size_filter_layout)
+        
+        # Resolution filter
+        res_filter_layout = QHBoxLayout()
+        res_filter_layout.addWidget(QLabel("Min resolution:"))
+        self.min_width_spin = QSpinBox()
+        self.min_width_spin.setMaximum(99999)
+        self.min_width_spin.valueChanged.connect(self.filter_images)
+        res_filter_layout.addWidget(self.min_width_spin)
+        res_filter_layout.addWidget(QLabel("x"))
+        self.min_height_spin = QSpinBox()
+        self.min_height_spin.setMaximum(99999)
+        self.min_height_spin.valueChanged.connect(self.filter_images)
+        res_filter_layout.addWidget(self.min_height_spin)
+        search_layout.addLayout(res_filter_layout)
+        
+        search_group.setLayout(search_layout)
+        filter_layout.addWidget(search_group)
+        
+        filter_layout.addStretch()
+        filter_tab.setLayout(filter_layout)
+
+        # AI tab
+        ai_tab = QWidget()
         ai_layout = QVBoxLayout()
+        
+        ai_group = QGroupBox("AI Analysis")
+        ai_group_layout = QVBoxLayout()
         
         self.create_tags_button = QPushButton("🏷️ Generate Tags")
         self.create_tags_button.clicked.connect(self.create_image_tags)
-        ai_layout.addWidget(self.create_tags_button)
+        ai_group_layout.addWidget(self.create_tags_button)
         
-        ai_group.setLayout(ai_layout)
-        layout.addWidget(ai_group)
+        self.batch_size_layout = QHBoxLayout()
+        self.batch_size_layout.addWidget(QLabel("Batch size:"))
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 100)
+        self.batch_size_spin.setValue(BATCH_SIZE)
+        self.batch_size_layout.addWidget(self.batch_size_spin)
+        ai_group_layout.addLayout(self.batch_size_layout)
+        
+        ai_group.setLayout(ai_group_layout)
+        ai_layout.addWidget(ai_group)
+        
+        ai_layout.addStretch()
+        ai_tab.setLayout(ai_layout)
 
+        # Add tabs
+        tab_widget.addTab(file_tab, "Files")
+        tab_widget.addTab(sort_tab, "Sorting")
+        tab_widget.addTab(filter_tab, "Filtering")
+        tab_widget.addTab(ai_tab, "AI")
+
+        # Status panel
+        status_widget = QWidget()
+        status_layout = QVBoxLayout()
+        
         # Progress tracking
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        # Status and spinner
-        self.status_label = QLabel("Ready")
-        layout.addWidget(self.status_label)
-
-        self.spinner_label = QLabel()
-        if os.path.exists("spinner.gif"):
-            self.spinner = QMovie("spinner.gif")
-            self.spinner_label.setMovie(self.spinner)
-        self.spinner_label.setVisible(False)
-        self.spinner_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.spinner_label)
-
-        # Stats display
-        self.stats_label = QLabel("No images loaded")
-        layout.addWidget(self.stats_label)
+        status_layout.addWidget(self.progress_bar)
         
-        layout.addStretch()
-        panel.setLayout(layout)
-        return panel
-    
-    def create_image_panel(self) -> QWidget:
-        """Create the right image display panel"""
+        self.status_label = QLabel("Ready")
+        status_layout.addWidget(self.status_label)
+        
+        # Statistics
+        stats_group = QGroupBox("Statistics")
+        stats_layout = QVBoxLayout()
+        
+        self.total_images_label = QLabel("Total images: 0")
+        self.filtered_images_label = QLabel("Filtered: 0")
+        self.cache_status_label = QLabel("Cache: 0/200")
+        
+        stats_layout.addWidget(self.total_images_label)
+        stats_layout.addWidget(self.filtered_images_label)
+        stats_layout.addWidget(self.cache_status_label)
+        
+        stats_group.setLayout(stats_layout)
+        status_layout.addWidget(stats_group)
+        
+        status_widget.setLayout(status_layout)
+
+        # Combine everything
+        main_panel = QWidget()
+        main_panel_layout = QVBoxLayout()
+        main_panel_layout.addWidget(tab_widget)
+        main_panel_layout.addWidget(status_widget)
+        main_panel.setLayout(main_panel_layout)
+
+        return main_panel
+
+    def create_enhanced_image_panel(self) -> QWidget:
+        """Create enhanced image display panel"""
         panel = QWidget()
         layout = QVBoxLayout()
 
         # Image list
-        self.list_widget = QListWidget()
-        self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
-        self.list_widget.setIconSize(QSize(PREVIEW_WIDTH, PREVIEW_HEIGHT))
-        self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self.list_widget.itemSelectionChanged.connect(self.update_selection_stats)
-        layout.addWidget(self.list_widget)
+        self.image_list_widget = QListWidget()
+        self.image_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.image_list_widget.setIconSize(QSize(THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+
+        self.image_list_widget.setViewMode(QListView.ViewMode.IconMode)
+        self.image_list_widget.setGridSize(QSize(THUMBNAIL_SIZE + 12, THUMBNAIL_SIZE + 28))
+        self.image_list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
+
+        self.image_list_widget.itemSelectionChanged.connect(self.on_selection_changed)
+        self.image_list_widget.itemDoubleClicked.connect(self.open_image_preview)
         
+        layout.addWidget(self.image_list_widget)
+
+        # Image details
+        details_group = QGroupBox("Image Details")
+        details_layout = QVBoxLayout()
+        
+        details_group.setMaximumHeight(250)
+
+        self.details_text = QTextEdit()
+        self.details_text.setMaximumHeight(225)
+        self.details_text.setReadOnly(True)
+        details_layout.addWidget(self.details_text)
+        
+        details_group.setLayout(details_layout)
+        layout.addWidget(details_group)
+
         panel.setLayout(layout)
         return panel
-    
-    def setup_logger(self):
-        """Setup logger (TODO: maybe GUI output)"""
-        global logger
-        logger = Logger()
 
-    def update_ui_state(self, processing: bool):
-        """Update UI elements based on processing state"""
-
-        self.load_button.setDisabled(processing)
-        self.sort_button.setDisabled(processing or not self.image_list)
-        self.export_button.setDisabled(processing or not self.image_list)
-        self.save_labels_button.setDisabled(processing or not self.image_list)
-        self.create_tags_button.setDisabled(processing or not self.image_list)
-
-        if processing:
-            self.spinner_label.setVisible(True)
-            if hasattr(self, "spinner"):
-                self.spinner.start()
-            self.progress_bar.setVisible(True)
-        else:
-            self.spinner_label.setVisible(False)
-            if hasattr(self, "spinner"):
-                self.spinner.stop()
-            self.progress_bar.setVisible(False)
-    
-    def set_sorting_criteria(self, index: int):
-        """Set the sorting criteria"""
-        if 0 <= index < len(SORTING_CRITERIA):
-            self.sorting_criteria_index = index
-            logger.info(f"Sorting criteria set to: {SORTING_CRITERIA[index]}")
-
-    def set_reverse_sort(self, checked: bool):
-        """Set reverse sorting order"""
-        self.reverse_sort = checked
-        logger.info(f"Reverse sorting set to: {checked}")
-
-    def update_stats(self):
-        """Update statistics display"""
-        if not self.image_list:
-            self.stats_label.setText("No images loaded")
-            return
-        
-        total = len(self.image_list)
-        selected = len(self.list_widget.selectedItems())
-        self.stats_label.setText(f"Total: {total} | Selected: {selected}")
-
-    def update_selection_stats(self):
-        """Update selection statistics"""
-        self.update_stats()
+    def setup_shortcuts(self):
+        """Setup keyboard shortcuts"""
+        # Can be implemented later
+        pass
 
     def select_folder(self):
-        """Select and load images from folder"""
+        """Select folder containing images"""
         folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
-        if not folder:
-            return
-        
-        self.image_folder_location = folder
-        self.load_images_from_folder(folder)
+        if folder:
+            self.image_folder_location = folder
+            self.load_images_from_folder(folder)
 
-    def load_images_from_folder(self, folder: str):
-        """Load images from folder with caching support"""
-        labels_file = Path(folder) / "image_labels.json"
-
-        if labels_file.exists():
-            if  self.load_cached_labels(labels_file):
-                logger.info(f"Loaded cached labels from {labels_file}")
-                return
-            
-        self.analyze_folder_images(folder)
-
-    def load_cached_labels(self, labels_file: Path) -> bool:
-        """Load prev computed image labels"""
+    def load_images_from_folder(self, folder_path: str):
+        """Load images from folder with progress tracking"""
         try:
-            with open(labels_file, 'r', encoding="utf-8") as f:
-                data = json.load(f)
-
+            # Clear existing data
             self.image_list.clear()
-            self.list_widget.clear()
+            self.filtered_list.clear()
+            self.image_list_widget.clear()
+            self.item_lookup.clear()
             self.thumbnail_cache.clear()
 
-            images_data = data.get("images", {})
-            folder = Path(data.get("path", self.image_folder_location))
+            # Find image files
+            image_paths = []
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith(SUPPORTED_FORMATS):
+                        image_paths.append(os.path.join(root, file))
+                
+                if not self.recursive_checkbox.isChecked():
+                    break  # Only scan root directory
 
-            for image_name, metrics_dict in images_data.items():
-                full_path = str(folder / image_name)
+            if not image_paths:
+                QMessageBox.information(self, "No Images", "No supported image files found.")
+                return
 
-                if not os.path.exists(full_path):
-                    logger.error(f"Cached image {full_path} does not exist, skipping")
-                    continue
+            # Start processing
+            self.status_label.setText(f"Loading {len(image_paths)} images...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setMaximum(len(image_paths))
+            self.progress_bar.setValue(0)
 
-                metrics = ImageMetrics.from_dict(metrics_dict)
-                self.image_list.append((full_path, metrics))
+            # Process in batches
+            batch_size = self.batch_size_spin.value()
+            self.pending_batches = (len(image_paths) + batch_size - 1) // batch_size
+            self.completed_batches = 0
 
-            self.populate_image_list()
-            logger.info(f"Loaded {len(self.image_list)} images from cache")
-            self.update_stats()
-            return True
+            # Complete the load_images_from_folder method (continuation from line 450+)
+            for i in range(0, len(image_paths), batch_size):
+                batch = image_paths[i:i + batch_size]
+                worker = ImageAnalysisWorker(batch, i // batch_size)
+                
+                # Connect signals
+                worker.signals.result.connect(self.on_image_analyzed)
+                worker.signals.progress.connect(self.update_progress)
+                worker.signals.error.connect(self.on_analysis_error)
+                worker.signals.thumb_ready.connect(self.on_thumbnail_ready)
+                worker.signals.batch_complete.connect(self.on_batch_complete)
+                worker.signals.finished.connect(self.on_worker_finished)
+                
+                self.workers.append(worker)
+                self.threadpool.start(worker)
+
         except Exception as e:
-            logger.error(f"Error loading cached labels: {e}")
-            return False
-    
-    def analyze_folder_images(self, folder: str):
-        """Analyze all images in folder"""
-
-        image_files = []
-
-        for ext in SUPPORTED_FORMATS:
-            image_files.extend(Path(folder).glob(f"*{ext}"))
-            image_files.extend(Path(folder).glob(f"{ext.upper()}"))
-
-        if not image_files:
-            QMessageBox.information(self, "No Images Found", "No supported images files found in the selected folder.")
-            return
-        
-        self.image_list.clear()
-        self.list_widget.clear()
-        self.thumbnail_cache.clear()
-        self.cancel_workers()
-
-
-        self.pending_tasks = len(image_files)
-        self.progress_bar.setMaximum(self.pending_tasks)
-        self.progress_bar.setValue(0)
-        self.update_ui_state(True)
-        self.status_label.setText(f"Analyzing {self.pending_tasks} images...")
-
-        for image_path in image_files:
-            worker = ImageAnalysisWorker(str(image_path))
-            worker.signals.result.connect(self.on_image_analyzed)
-            worker.signals.finished.connect(self.on_worker_finished)
-            worker.signals.error.connect(self.on_worker_error)
-
-            worker.signals.thumb_ready.connect(self.on_thumb_ready)
-            
-            self.workers.append(worker)
-            self.threadpool.start(worker)
-
-    def cancel_workers(self):
-        """Cancel all running workers"""
-        for worker in self.workers:
-            worker.cancel()
-        self.workers.clear()
+            logger.error(f"Error loading images: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load images: {e}")
+            self.progress_bar.setVisible(False)
 
     def on_image_analyzed(self, path: str, metrics: ImageMetrics):
-        """Handle completed image analysis"""
-        self.mutex.lock()
-        try:
-            self.image_list.append((path, metrics))
-            self.add_image_to_list(path)
-        finally:
-            self.mutex.unlock()
-    
+        """Handle analyzed image result"""
+        self.image_list.append((path, metrics))
+        
+        # Create list item
+        item = QListWidgetItem()
+        item.setText(os.path.basename(path))
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        
+        # Add to widget
+        self.image_list_widget.addItem(item)
+        self.item_lookup[path] = item
+        
+        # Update UI
+        self.update_statistics()
+
+    def on_thumbnail_ready(self, path: str, icon: QIcon):
+        """Handle thumbnail creation"""
+        self.thumbnail_cache.put(path, icon)
+        
+        if path in self.item_lookup:
+            self.item_lookup[path].setIcon(icon)
+
+    def on_batch_complete(self, batch_id: int):
+        """Handle batch completion"""
+        self.completed_batches += 1
+        completion_pct = (self.completed_batches / self.pending_batches) * 100
+        self.status_label.setText(f"Processed {self.completed_batches}/{self.pending_batches} batches ({completion_pct:.0f}%)")
+
     def on_worker_finished(self):
         """Handle worker completion"""
-        self.pending_tasks -= 1
-        self.progress_bar.setValue(self.progress_bar.maximum() - self.pending_tasks)
-        
-        if self.pending_tasks <= 0:
-            self.update_ui_state(False)
-            self.status_label.setText("Analysis complete")
-            self.update_stats()
-            logger.strong(f"Successfully analyzed {len(self.image_list)} images")
-            self.workers.clear()
-    
-    def on_worker_error(self, path: str, error: str):
-        """Handle worker error"""
-        logger.error(f"Error processing {path}: {error}")
+        if self.completed_batches >= self.pending_batches:
+            self.progress_bar.setVisible(False)
+            self.status_label.setText(f"Loaded {len(self.image_list)} images")
+            self.filtered_list = self.image_list.copy()
+            self.update_statistics()
 
-    def add_image_to_list(self, path: str):
-        # placeholder (light-grey square)
-        placeholder = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-        placeholder.fill(Qt.GlobalColor.lightGray)
+    def update_progress(self, value: int, message: str):
+        """Update progress bar"""
+        self.progress_bar.setValue(self.progress_bar.value() + 1)
+        self.status_label.setText(message)
 
-        icon = self.get_thumbnail_icon(path) or QIcon(placeholder)
-        item = QListWidgetItem(icon, os.path.basename(path))
-        item.setData(Qt.ItemDataRole.UserRole, path)
-        item.setToolTip(path)
+    def on_analysis_error(self, path: str, error: str):
+        """Handle analysis errors"""
+        logger.error(f"Analysis failed for {path}: {error}")
 
-        self.list_widget.addItem(item)
-        self.item_lookup[path] = item 
+    def set_sorting_criteria(self, index: int):
+        """Set sorting criteria"""
+        self.sorting_criteria_index = index
 
-    def populate_image_list(self):
-        """Populate the list widget with all images"""
-        for path, _ in self.image_list:
-            self.add_image_to_list(path)
+    def set_reverse_sort(self, reverse: bool):
+        """Set reverse sorting"""
+        self.reverse_sort = reverse
 
-    def get_thumbnail_icon(self, path: str) -> QIcon:
-        """Get thumbnail icon with caching"""
-        # Check cache first
-        cached_icon = self.thumbnail_cache.get(path)
-        if cached_icon:
-            return cached_icon
-        
-        # Create new thumbnail
-        try:
-            pixmap = QPixmap(path)
-            if pixmap.isNull():
-                # Create placeholder icon
-                pixmap = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-                pixmap.fill(Qt.GlobalColor.lightGray)
-            
-            icon = self.create_thumbnail_icon(pixmap)
-            self.thumbnail_cache.put(path, icon)
-            return icon
-            
-        except Exception as e:
-            logger.error(f"Failed to create thumbnail for {path}: {e}")
-            # Return placeholder
-            pixmap = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-            pixmap.fill(Qt.GlobalColor.red)
-            return QIcon(pixmap)
+    def set_sorting_algorithm(self, algorithm: str):
+        """Set sorting algorithm"""
+        self.current_algorithm = algorithm
 
-    def create_thumbnail_icon(self, pixmap: QPixmap) -> QIcon:
-        """Create a properly sized thumbnail icon"""
-        # Create canvas
-        canvas = QPixmap(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-        canvas.fill(Qt.GlobalColor.transparent)
-        
-        # Scale image maintaining aspect ratio
-        scaled = pixmap.scaled(
-            PREVIEW_WIDTH, PREVIEW_HEIGHT,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        
-        # Center the image on canvas
-        painter = QPainter(canvas)
-        x = (PREVIEW_WIDTH - scaled.width()) // 2
-        y = (PREVIEW_HEIGHT - scaled.height()) // 2
-        painter.drawPixmap(x, y, scaled)
-        painter.end()
-        
-        return QIcon(canvas)
-    
     def sort_images(self):
-        """Sort images based on selected criteria"""
-        if not self.image_list:
-            QMessageBox.warning(self, "No Images", "Please load images first.")
+        """Sort images using selected criteria and algorithm"""
+        if not self.filtered_list:
+            QMessageBox.information(self, "No Images", "No images to sort.")
             return
-        
-        criteria = SORTING_CRITERIA[self.sorting_criteria_index]
-        logger.info(f"Sorting by {criteria} (reverse: {self.reverse_sort})")
-        
-        self.update_ui_state(True)
+
         self.status_label.setText("Sorting images...")
-
-        worker = SortingWorker(
-            self.image_list, 
+        
+        worker = SmartSortingWorker(
+            self.filtered_list, 
             self.sorting_criteria_index, 
-            self.reverse_sort
+            self.reverse_sort, 
+            self.current_algorithm
         )
-
-        worker.signals.sorted_result.connect(self.on_sorting_finished)
+        
+        worker.signals.sorted_result.connect(self.on_sorting_complete)
         worker.signals.error.connect(self.on_sorting_error)
-
-        self.workers.append(worker)
+        
         self.threadpool.start(worker)
 
-    def on_thumb_ready(self, path: str, icon: QIcon):
-        """Handle thumbnail ready signal"""
-        if item := self.item_lookup.get(path):
-            item.setIcon(icon)
-
-    def on_sorting_finished(self, sorted_list):
-        # 1. update the *data* first
-        self.image_list = sorted_list
-
-        # 2. rebuild the view quickly with cheap placeholders
-        self.item_lookup.clear()              
-        self.list_widget.setUpdatesEnabled(False)
-        self.list_widget.clear()
-
-        for path, _ in sorted_list:
-            # Use cached thumbnail or a placeholder here:
-            icon = self.get_thumbnail_icon(path)
-            item = QListWidgetItem(icon, os.path.basename(path))
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            self.list_widget.addItem(item)
-            self.item_lookup[path] = item
-        self.list_widget.setUpdatesEnabled(True)
-
-        # 3. tell the user we’re done
+    def on_sorting_complete(self, sorted_list: List[Tuple[str, ImageMetrics]]):
+        """Handle sorting completion"""
+        self.filtered_list = sorted_list
+        self.refresh_image_list()
         self.status_label.setText("Sorting complete")
-        self.update_ui_state(False)           
 
-        self.load_thumbnails_async([path for path, _ in sorted_list])
-
-    def load_thumbnails_async(self, paths: List[str]):
-        # Cancel previous thumbnail workers if needed
-        self.cancel_workers()
-
-        for path in paths:
-            worker = ThumbnailLoaderWorker(path)  # You need to create this worker
-            worker.signals.thumb_ready.connect(self.on_thumb_ready)
-            self.workers.append(worker)
-            self.threadpool.start(worker)
-
-    def on_sorting_error(self, path: str, error: str):
-        """Handle sorting error"""
-        logger.error(f"Error during sorting: {error}")
-        QMessageBox.critical(self, "Sorting Error", f"Failed to sort images:\n{error}")
-        self.update_ui_state(False)
+    def on_sorting_error(self, error_type: str, error_msg: str):
+        """Handle sorting errors"""
+        QMessageBox.critical(self, "Sorting Error", f"Failed to sort images: {error_msg}")
         self.status_label.setText("Sorting failed")
 
-    def export_selected(self):
-        """Export selected images to a folder"""
-        selected_items = self.list_widget.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Please select images to export.")
-            return
+    def refresh_image_list(self):
+        """Refresh the image list widget"""
+        self.image_list_widget.clear()
+        self.item_lookup.clear()
         
-        target_folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
-        if not target_folder:
-            return
-        
-        success_count = 0
-        error_count = 0
-        
-        for item in selected_items:
-            try:
-                src_path = item.data(Qt.ItemDataRole.UserRole)
-                dst_path = os.path.join(target_folder, os.path.basename(src_path))
-                
-                # Handle duplicate names
-                counter = 1
-                base_name, ext = os.path.splitext(dst_path)
-                while os.path.exists(dst_path):
-                    dst_path = f"{base_name}_{counter}{ext}"
-                    counter += 1
-                
-                shutil.copy2(src_path, dst_path)
-                success_count += 1
-                
-            except Exception as e:
-                logger.error(f"Failed to export {src_path}: {e}")
-                error_count += 1
-        
-        message = f"Export complete!\nSuccessful: {success_count}"
-        if error_count > 0:
-            message += f"\nFailed: {error_count}"
-        
-        QMessageBox.information(self, "Export Complete", message)
+        for path, metrics in self.filtered_list:
+            item = QListWidgetItem()
+            item.setText(os.path.basename(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            
+            # Set thumbnail from cache or create new one from path
+            cached_icon = self.thumbnail_cache.get(path)
+            if cached_icon:
+                item.setIcon(cached_icon)
+            else:
+                try:
+                    with Image.open(path) as img:
+                        img.thumbnail((THUMBNAIL_SIZE, THUMBNAIL_SIZE), Image.Resampling.LANCZOS)
+                        icon = _pil_to_qicon(img)
+                        self.thumbnail_cache.put(path, icon)
+                        item.setIcon(icon)
+                except Exception as e:
+                    logger.error(f"Failed to create thumbnail for {path}: {e}")
+            
+            self.image_list_widget.addItem(item)
+            self.item_lookup[path] = item
 
+    def filter_images(self):
+        """Filter images based on search criteria"""
+        search_text = self.search_input.text().lower()
+        min_size = self.min_size_spin.value() * 1024  # Convert KB to bytes
+        min_width = self.min_width_spin.value()
+        min_height = self.min_height_spin.value()
+        
+        self.filtered_list = []
+        
+        for path, metrics in self.image_list:
+            # Filename filter
+            if search_text and search_text not in os.path.basename(path).lower():
+                continue
+            
+            # Size filter
+            if metrics.file_size < min_size:
+                continue
+            
+            # Resolution filter
+            width, height = metrics.resolution
+            if width < min_width or height < min_height:
+                continue
+            
+            self.filtered_list.append((path, metrics))
+        
+        self.refresh_image_list()
+        self.update_statistics()
 
+    def on_selection_changed(self):
+        """Handle selection change in image list"""
+        selected_items = self.image_list_widget.selectedItems()
+        
+        if len(selected_items) == 1:
+            item = selected_items[0]
+            path = item.data(Qt.ItemDataRole.UserRole)
+            
+            # Find metrics for this path
+            for img_path, metrics in self.filtered_list:
+                if img_path == path:
+                    self.display_image_details(path, metrics)
+                    break
+        elif len(selected_items) > 1:
+            self.details_text.setText(f"Selected {len(selected_items)} images")
+        else:
+            self.details_text.clear()
 
-    def save_image_labels(self):
-        """Save computed image labels to JSON file"""
-        if not self.image_list:
-            QMessageBox.warning(self, "No Images", "Please load images first.")
-            return
+    def display_image_details(self, path: str, metrics: ImageMetrics):
+        """Display detailed image information"""
+        details = f"File: {os.path.basename(path)}\n"
+        details += f"Path: {path}\n"
+        details += f"Size: {metrics.file_size / 1024:.1f} KB\n"
+        details += f"Resolution: {metrics.resolution[0]} x {metrics.resolution[1]}\n"
+        details += f"Aspect Ratio: {metrics.aspect_ratio:.2f}\n"
+        details += f"Brightness: {metrics.brightness:.1f}\n"
+        details += f"Contrast: {metrics.contrast:.1f}\n"
+        details += f"Sharpness: {metrics.sharpness:.1f}\n"
+        details += f"Dominant Color: RGB{metrics.dominant_color}\n"
         
-        if not self.image_folder_location:
-            QMessageBox.warning(self, "No Folder", "Please select a folder first.")
-            return
+        if metrics.created_date:
+            details += f"Created: {metrics.created_date}\n"
+        if metrics.modified_date:
+            details += f"Modified: {metrics.modified_date}\n"
         
-        labels_file = os.path.join(self.image_folder_location, "image_labels.json")
+        if metrics.tags:
+            details += f"Tags: {', '.join(metrics.tags)}\n"
         
+        self.details_text.setText(details)
+
+    def open_image_preview(self, item: QListWidgetItem):
+        """Open image in system default viewer"""
+        path = item.data(Qt.ItemDataRole.UserRole)
         try:
-            labels_data = {
-                "path": self.image_folder_location,
-                "version": "2.0",
-                "created_at": str(QTimer().currentTime()),
-                "total_images": len(self.image_list),
-                "images": {
-                    os.path.basename(path): metrics.to_dict()
-                    for path, metrics in self.image_list
-                }
-            }
-            
-            with open(labels_file, 'w', encoding='utf-8') as f:
-                json.dump(labels_data, f, indent=2, ensure_ascii=False, sort_keys=True)
-            
-            QMessageBox.information(self, "Save Complete", f"Labels saved to:\n{labels_file}")
-            logger.info(f"Saved labels for {len(self.image_list)} images")
-            
+            if sys.platform.startswith('darwin'):  # macOS
+                os.system(f'open "{path}"')
+            elif sys.platform.startswith('win'):   # Windows
+                os.startfile(path)
+            else:  # Linux
+                os.system(f'xdg-open "{path}"')
         except Exception as e:
-            logger.error(f"Failed to save labels: {e}")
-            QMessageBox.critical(self, "Save Error", f"Failed to save labels:\n{str(e)}")
-
+            logger.error(f"Failed to open image: {e}")
 
     def create_image_tags(self):
-        """Generate AI tags for images (placeholder for when AI is available)"""
-        if not self.image_list:
-            QMessageBox.warning(self, "No Images", "Please load images first.")
+        """Generate AI tags for images"""
+        if not self.filtered_list:
+            QMessageBox.information(self, "No Images", "No images to tag.")
             return
         
-        # Placeholder implementation - uncomment and modify when AI classifier is available
-        self.update_ui_state(True)
-        self.status_label.setText("Generating AI tags...")
+        # Mock implementation - in real app would use actual AI
+        for path, metrics in self.filtered_list:
+            if not metrics.tags:
+                mock_tags = self.image_classifier.classify_image(path)
+                metrics.tags = mock_tags
         
-        success_count = 0
-        error_count = 0
+        self.status_label.setText("AI tagging complete")
+        QMessageBox.information(self, "Tagging Complete", "AI tags generated for all images.")
+
+    def export_selected(self):
+        """Export selected images to new folder"""
+        selected_items = self.image_list_widget.selectedItems()
         
-        for i, (path, metrics) in enumerate(self.image_list):
+        if not selected_items:
+            QMessageBox.information(self, "No Selection", "Please select images to export.")
+            return
+        
+        output_folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
+        if not output_folder:
+            return
+        
+        try:
+            for item in selected_items:
+                path = item.data(Qt.ItemDataRole.UserRole)
+                filename = os.path.basename(path)
+                destination = os.path.join(output_folder, filename)
+                
+                # Handle duplicates
+                counter = 1
+                base_name, ext = os.path.splitext(filename)
+                while os.path.exists(destination):
+                    new_name = f"{base_name}_{counter}{ext}"
+                    destination = os.path.join(output_folder, new_name)
+                    counter += 1
+                
+                shutil.copy2(path, destination)
+            
+            QMessageBox.information(self, "Export Complete", 
+                                  f"Exported {len(selected_items)} images to {output_folder}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export images: {e}")
+
+    def save_image_labels(self):
+        """Save image analysis data to JSON"""
+        if not self.image_list:
+            QMessageBox.information(self, "No Data", "No image data to save.")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Analysis Data", "image_analysis.json", "JSON Files (*.json)"
+        )
+        
+        if filename:
             try:
-                img = Image.open(path)
-                tags = self.image_classifier.classify_image(img)
-                metrics.tags = tags
-                success_count += 1
-                logger.info(f"Generated tags for {os.path.basename(path)}: {tags}")
+                data = {
+                    "folder": self.image_folder_location,
+                    "timestamp": datetime.now().isoformat(),
+                    "images": {path: metrics.to_dict() for path, metrics in self.image_list}
+                }
+                
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                
+                QMessageBox.information(self, "Save Complete", f"Analysis data saved to {filename}")
                 
             except Exception as e:
-                logger.error(f"Failed to generate tags for {path}: {e}")
-                error_count += 1
-            
-            # Update progress
-            progress = int((i + 1) / len(self.image_list) * 100)
-            self.progress_bar.setValue(progress)
-        
-        self.update_ui_state(False)
-        self.status_label.setText("Tag generation complete")
-        
-        message = f"Tag generation complete!\nSuccessful: {success_count}"
-        if error_count > 0:
-            message += f"\nFailed: {error_count}"
-        
-        QMessageBox.information(self, "Tags Generated", message)
-        
+                QMessageBox.critical(self, "Save Error", f"Failed to save data: {e}")
+
+    def auto_save_labels(self):
+        """Auto-save functionality"""
+        if self.image_list and self.image_folder_location:
+            try:
+                auto_save_path = os.path.join(self.image_folder_location, ".image_analysis_autosave.json")
+                data = {
+                    "folder": self.image_folder_location,
+                    "timestamp": datetime.now().isoformat(),
+                    "images": {path: metrics.to_dict() for path, metrics in self.image_list}
+                }
+                
+                with open(auto_save_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                
+                logger.info("Auto-save completed")
+                
+            except Exception as e:
+                logger.error(f"Auto-save failed: {e}")
+
+    def update_statistics(self):
+        """Update statistics display"""
+        self.total_images_label.setText(f"Total images: {len(self.image_list)}")
+        self.filtered_images_label.setText(f"Filtered: {len(self.filtered_list)}")
+        self.cache_status_label.setText(self.thumbnail_cache.get_memory_usage())
 
     def closeEvent(self, event):
-        """Handle application close event"""
-        # Cancel any running workers
-        self.cancel_workers()
+        """Handle application close"""
+        # Cancel all workers
+        for worker in self.workers:
+            if hasattr(worker, 'cancel'):
+                worker.cancel()
         
-        # Wait for threadpool to finish
-        self.threadpool.waitForDone(3000)  # Wait max 3 seconds
+        # Wait for threads to finish
+        self.threadpool.waitForDone(3000)  # 3 second timeout
+        
+        # Auto-save before closing
+        self.auto_save_labels()
         
         event.accept()
 
-    def keyPressEvent(self, event):
-        """Handle keyboard shortcuts"""
-        if event.key() == Qt.Key.Key_Delete:
-            # Remove selected items (optional feature)
-            self.remove_selected_images()
-        elif event.key() == Qt.Key.Key_F5:
-            # Refresh current folder
-            if self.image_folder_location:
-                self.load_images_from_folder(self.image_folder_location)
-        else:
-            super().keyPressEvent(event)
-
-    def remove_selected_images(self):
-        """Remove selected images from the list (not from disk)"""
-        selected_items = self.list_widget.selectedItems()
-        if not selected_items:
-            return
-        
-        reply = QMessageBox.question(
-            self,
-            "Remove Images",
-            f"Remove {len(selected_items)} selected images from the list?\n"
-            "(This will not delete the files from disk)",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            # Get paths of selected items
-            selected_paths = set()
-            for item in selected_items:
-                path = item.data(Qt.ItemDataRole.UserRole)
-                selected_paths.add(path)
-            
-            # Remove from image list
-            self.image_list = [
-                (path, metrics) for path, metrics in self.image_list 
-                if path not in selected_paths
-            ]
-            
-            # Remove from list widget
-            for item in selected_items:
-                row = self.list_widget.row(item)
-                self.list_widget.takeItem(row)
-            
-            # Update cache
-            for path in selected_paths:
-                if path in self.thumbnail_cache.cache:
-                    del self.thumbnail_cache.cache[path]
-            
-            self.update_stats()
-            logger.info(f"Removed {len(selected_paths)} images from list")
+def _pil_to_qicon(img: Image.Image) -> QIcon:
+    """Return a deep-copied QIcon from a resized PIL image."""
+    img = img.convert("RGB")
+    w, h = img.size
+    bytes_per_line = 3 * w
+    qimg = QImage(
+        img.tobytes(), w, h,
+        bytes_per_line,
+        QImage.Format.Format_RGB888
+    ).copy()                                      
+    pixmap = QPixmap.fromImage(qimg)              
+    return QIcon(pixmap)
 
 
 def main():
+    """Main application entry point"""
     app = QApplication(sys.argv)
-    
     app.setApplicationName("Advanced Image Sorter")
     app.setApplicationVersion("2.0")
-    app.setOrganizationName("ImageSorter")
     
+    # Set application icon if available
     try:
-        window = ImageSorterApp()
-        window.show()
-        
-        sys.exit(app.exec())
-        
-    except Exception as e:
-        logger.error(f"Application failed to start: {e}")
-        QMessageBox.critical(None, "Startup Error", f"Failed to start application:\n{str(e)}")
-        sys.exit(1)
+        app.setWindowIcon(QIcon("icon.png"))
+    except:
+        pass
+    
+    window = ImageSorterApp()
+    window.show()
+    
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()

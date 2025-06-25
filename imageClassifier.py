@@ -19,6 +19,6 @@ class ImageClassifierAi:
     Returns:
         List[str]: A list of tags predicted by the model.
     '''
-    def classify_image(self, img: ImageFile) -> List[str]:
+    def classify_image(self, path: str) -> List[str]:
         return ["tag1", "tag2", "tag3"]  
     
