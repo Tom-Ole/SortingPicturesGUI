@@ -1,15 +1,12 @@
 import sys
 import os
 import shutil
-from typing import List, Tuple, Optional, Dict, Any, Set
+from typing import List, Tuple, Dict, Set
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from collections import deque
-import time
 
-import numpy as np
-from PIL import Image, ImageFilter, ImageStat
+from PIL import Image
 from PIL.ExifTags import TAGS
 
 from PyQt6.QtWidgets import (
@@ -19,13 +16,16 @@ from PyQt6.QtWidgets import (
     QGroupBox, QCheckBox, QSpinBox, QTextEdit, QTabWidget,
     QLineEdit, QListView
 )
-from PyQt6.QtGui import QPixmap, QIcon, QImage
-from PyQt6.QtCore import (Qt, QSize, QThreadPool, QRunnable, pyqtSignal, 
-                          QObject, QTimer, QMutex, pyqtSlot)
+from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import (Qt, QSize, QThreadPool, QRunnable, QTimer, QMutex)
 
 
 from logger import Logger
 from imageClassifier import ImageClassifierAi
+from imageMetrics import ImageMetrics
+from worker import ImageAnalysisWorker, SmartSortingWorker
+from cache import EnhancedThumbnailCache
+from imageProcessor import _pil_to_qicon
 
 logger = Logger()
 
@@ -52,349 +52,6 @@ MAX_WORKERS = min(12, (os.cpu_count() or 4) * 2)
 CACHE_SIZE = 300
 BATCH_SIZE = 50
 
-@dataclass
-class ImageMetrics:
-    """Enhanced image metrics with validation and EXIF data"""
-    dominant_color: Tuple[int, int, int] = (0, 0, 0)
-    brightness: float = 0.0
-    contrast: float = 0.0
-    aspect_ratio: float = 1.0
-    file_size: int = 0
-    resolution: Tuple[int, int] = (0, 0)
-    sharpness: float = 0.0
-    color_variance: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    created_date: Optional[str] = None
-    modified_date: Optional[str] = None
-    tags: List[str] = None
-    exif_data: Dict[str, Any] = None
-    histogram: Tuple[List[int], List[int], List[int]] = None
-    
-    def __post_init__(self):
-        if self.tags is None:
-            self.tags = []
-        if self.exif_data is None:
-            self.exif_data = {}
-        if self.histogram is None:
-            self.histogram = ([], [], [])
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ImageMetrics':
-        """Create instance from dictionary"""
-        return cls(**data)
-
-class ImageProcessor:
-    """Enhanced image processing with better algorithms and error handling"""
-
-    @staticmethod
-    def compute_dominant_color(img: Image.Image) -> Tuple[int, int, int]:
-        """Compute dominant color using simple quantization"""
-        try:
-            img_small = img.convert("RGB").resize((50, 50))
-            img_quantized = img_small.quantize(colors=8)
-            palette = img_quantized.getpalette()
-            
-            if not palette:
-                return (128, 128, 128)
-            
-            colors = img_quantized.getcolors(maxcolors=8)
-            if not colors:
-                return (128, 128, 128)
-            
-            most_frequent = max(colors, key=lambda x: x[0])
-            color_index = most_frequent[1]
-            
-            r = palette[color_index * 3]
-            g = palette[color_index * 3 + 1] 
-            b = palette[color_index * 3 + 2]
-            
-            return (r, g, b)
-        except Exception as e:
-            logger.error(f"Error computing dominant color: {e}")
-            return (128, 128, 128)
-    
-    @staticmethod
-    def compute_brightness(img: Image.Image) -> float:
-        """Compute average brightness using ImageStat"""
-        try:
-            stat = ImageStat.Stat(img.convert("L").resize((100, 100)))
-            return stat.mean[0]
-        except Exception as e:
-            logger.error(f"Error computing brightness: {e}")
-            return 128.0
-    
-    @staticmethod
-    def compute_contrast(img: Image.Image) -> float:
-        """Compute contrast using standard deviation"""
-        try:
-            stat = ImageStat.Stat(img.convert("L").resize((100, 100)))
-            return stat.stddev[0]
-        except Exception as e:
-            logger.error(f"Error computing contrast: {e}")
-            return 0.0
-    
-    @staticmethod
-    def compute_aspect_ratio(img: Image.Image) -> float:
-        """Compute width/height ratio"""
-        width, height = img.size
-        return width / height if height != 0 else 1.0
-    
-    @staticmethod
-    def compute_file_info(image_path: str) -> Tuple[int, Optional[str], Optional[str]]:
-        """Get file size and timestamps"""
-        try:
-            stat = os.stat(image_path)
-            file_size = stat.st_size
-            created_date = datetime.fromtimestamp(stat.st_ctime).isoformat()
-            modified_date = datetime.fromtimestamp(stat.st_mtime).isoformat()
-            return file_size, created_date, modified_date
-        except Exception as e:
-            logger.error(f"Error getting file info for {image_path}: {e}")
-            return 0, None, None
-    
-    @staticmethod
-    def compute_resolution(img: Image.Image) -> Tuple[int, int]:
-        """Get image resolution"""
-        return img.size
-    
-    @staticmethod
-    def compute_sharpness(img: Image.Image) -> float:
-        """Compute sharpness using Laplacian variance - optimized"""
-        try:
-            img_gray = img.convert("L").resize((200, 200))
-            edges = img_gray.filter(ImageFilter.Kernel((3, 3), 
-                [-1, -1, -1, -1, 8, -1, -1, -1, -1], 1, 0))
-            stat = ImageStat.Stat(edges)
-            return stat.var[0]
-        except Exception as e:
-            logger.error(f"Error computing sharpness: {e}")
-            return 0.0
-    
-    @staticmethod
-    def compute_color_variance(img: Image.Image) -> Tuple[float, float, float]:
-        """Compute color variance per channel using PIL stats"""
-        try:
-            img_rgb = img.resize((100, 100)).convert("RGB")
-            r, g, b = img_rgb.split()
-            
-            r_stat = ImageStat.Stat(r)
-            g_stat = ImageStat.Stat(g)
-            b_stat = ImageStat.Stat(b)
-            
-            return (r_stat.var[0], g_stat.var[0], b_stat.var[0])
-        except Exception as e:
-            logger.error(f"Error computing color variance: {e}")
-            return (0.0, 0.0, 0.0)
-    
-    @staticmethod
-    def extract_exif_data(img: Image.Image) -> Dict[str, Any]:
-        """Extract EXIF data from image"""
-        try:
-            exif_data = {}
-            if hasattr(img, '_getexif') and img._getexif():
-                exif = img._getexif()
-                for tag_id, value in exif.items():
-                    tag = TAGS.get(tag_id, tag_id)
-                    exif_data[tag] = str(value)
-            return exif_data
-        except Exception as e:
-            logger.error(f"Error extracting EXIF data: {e}")
-            return {}
-    
-    @staticmethod
-    def compute_histogram(img: Image.Image) -> Tuple[List[int], List[int], List[int]]:
-        """Compute RGB histogram"""
-        try:
-            img_rgb = img.convert("RGB").resize((100, 100))
-            r, g, b = img_rgb.split()
-            return (r.histogram(), g.histogram(), b.histogram())
-        except Exception as e:
-            logger.error(f"Error computing histogram: {e}")
-            return ([], [], [])
-    
-    @classmethod
-    def analyze_image(cls, image_path: str) -> ImageMetrics:
-        """Analyze image and return comprehensive metrics"""
-        try:
-            with Image.open(image_path) as img:
-                file_size, created_date, modified_date = cls.compute_file_info(image_path)
-                
-                return ImageMetrics(
-                    dominant_color=cls.compute_dominant_color(img),
-                    brightness=cls.compute_brightness(img),
-                    contrast=cls.compute_contrast(img),
-                    aspect_ratio=cls.compute_aspect_ratio(img),
-                    file_size=file_size,
-                    resolution=cls.compute_resolution(img),
-                    sharpness=cls.compute_sharpness(img),
-                    color_variance=cls.compute_color_variance(img),
-                    created_date=created_date,
-                    modified_date=modified_date,
-                    exif_data=cls.extract_exif_data(img),
-                    histogram=cls.compute_histogram(img)
-                )
-        except Exception as e:
-            logger.error(f"Error analyzing image {image_path}: {e}")
-            return ImageMetrics()
-
-class WorkerSignals(QObject):
-    """Enhanced worker signals with better progress tracking"""
-    finished = pyqtSignal()
-    result = pyqtSignal(str, ImageMetrics)
-    progress = pyqtSignal(int, str)
-    error = pyqtSignal(str, str)
-    sorted_result = pyqtSignal(list)
-    thumb_ready = pyqtSignal(str, QIcon)
-    batch_complete = pyqtSignal(int)
-
-class ImageAnalysisWorker(QRunnable):
-    """Optimized worker with better error handling and cancellation"""
-
-    def __init__(self, paths: List[str], batch_id: int = 0):
-        super().__init__()
-        self.paths = paths
-        self.batch_id = batch_id
-        self.signals = WorkerSignals()
-        self.is_cancelled = False
-
-    @pyqtSlot()
-    def run(self):
-        try:
-            total = len(self.paths)
-            for i, path in enumerate(self.paths):
-                if self.is_cancelled:
-                    return
-                
-                try:
-                    metrics = ImageProcessor.analyze_image(path)
-                    self.signals.result.emit(path, metrics)
-                    
-                    self._create_thumbnail(path)
-                    
-                    progress = int((i + 1) / total * 100)
-                    self.signals.progress.emit(progress, f"Processing {os.path.basename(path)}")
-                    
-                except Exception as e:
-                    self.signals.error.emit(path, str(e))
-                    
-            self.signals.batch_complete.emit(self.batch_id)
-            
-        except Exception as e:
-            logger.error(f"Batch processing error: {e}")
-        finally:
-            self.signals.finished.emit()
-
-
-    def _create_thumbnail(self, path: str):
-        """Create thumbnail with better quality"""
-        try:
-            with Image.open(path) as img:
-                img.thumbnail((PREVIEW_WIDTH, PREVIEW_HEIGHT), Image.Resampling.LANCZOS)
-                
-                icon = _pil_to_qicon(img)
-                
-                self.signals.thumb_ready.emit(path, icon)
-                
-        except Exception as e:
-            logger.error(f"Thumbnail creation failed for {path}: {e}")
-
-    def cancel(self):
-        self.is_cancelled = True
-
-class SmartSortingWorker(QRunnable):
-    """Enhanced sorting with multiple algorithms"""
-    
-    def __init__(self, image_list: List[Tuple[str, ImageMetrics]], 
-                 criteria_index: int, reverse: bool, algorithm: str = "Quick Sort"):
-        super().__init__()
-        self.image_list = image_list.copy()
-        self.criteria_index = criteria_index
-        self.reverse = reverse
-        self.algorithm = algorithm
-        self.signals = WorkerSignals()
-        self.is_cancelled = False
-    
-    @pyqtSlot()
-    def run(self):
-        try:
-            if self.is_cancelled:
-                return
-            
-            start_time = time.time()
-            criteria = SORTING_CRITERIA[self.criteria_index]
-            
-            # Use Python's built-in sorting (Timsort)
-            sorted_list = sorted(self.image_list, 
-                               key=lambda x: self._get_sort_key(x, criteria), 
-                               reverse=self.reverse)
-            
-            end_time = time.time()
-            logger.info(f"{self.algorithm} completed in {end_time - start_time:.2f} seconds")
-            
-            if not self.is_cancelled:
-                self.signals.sorted_result.emit(sorted_list)
-                
-        except Exception as e:
-            logger.error(f"Error in sorting worker: {e}")
-            self.signals.error.emit("sorting", str(e))
-    
-    def _get_sort_key(self, item: Tuple[str, ImageMetrics], criteria: str) -> Any:
-        """Get sort key for given criteria"""
-        path, metrics = item
-        
-        if criteria == "dominant_color":
-            r, g, b = metrics.dominant_color
-            return 0.299 * r + 0.587 * g + 0.114 * b
-        elif criteria == "resolution":
-            width, height = metrics.resolution
-            return width * height
-        elif criteria == "color_variance":
-            return sum(metrics.color_variance)
-        elif criteria == "filename":
-            return os.path.basename(path).lower()
-        elif criteria in ["created_date", "modified_date"]:
-            date_str = getattr(metrics, criteria)
-            return date_str if date_str else "1970-01-01T00:00:00"
-        else:
-            return getattr(metrics, criteria, 0)
-    
-    def cancel(self):
-        self.is_cancelled = True
-
-class EnhancedThumbnailCache:
-    """LRU cache with memory management"""
-
-    def __init__(self, max_size: int = CACHE_SIZE):
-        self.cache: Dict[str, QIcon] = {}
-        self.max_size = max_size
-        self.access_order: deque = deque()
-        self.mutex = QMutex()
-
-    def get(self, path: str) -> Optional[QIcon]:
-        if path in self.cache:
-            self.access_order.remove(path)
-            self.access_order.append(path)
-            return self.cache[path]
-        return None
-    
-    def put(self, path: str, icon: QIcon):
-        if len(self.cache) >= self.max_size:
-            oldest = self.access_order.popleft()
-            del self.cache[oldest]
-
-        self.cache[path] = icon
-        self.access_order.append(path)
-
-    def clear(self):
-        self.cache.clear()
-        self.access_order.clear()
-    
-    def get_memory_usage(self) -> str:
-        """Get estimated memory usage"""
-        return f"{len(self.cache)}/{self.max_size} thumbnails cached"
 
 class ImageSorterApp(QWidget):
     """Enhanced main application with better architecture"""
@@ -423,7 +80,7 @@ class ImageSorterApp(QWidget):
         self.selected_tags: Set[str] = set()
         
         # Enhanced caching
-        self.thumbnail_cache = EnhancedThumbnailCache()
+        self.thumbnail_cache = EnhancedThumbnailCache(max_size=CACHE_SIZE)
         
         # Mock AI classifier
         self.image_classifier = ImageClassifierAi("path/to/model")
@@ -748,7 +405,7 @@ class ImageSorterApp(QWidget):
             # Complete the load_images_from_folder method (continuation from line 450+)
             for i in range(0, len(image_paths), batch_size):
                 batch = image_paths[i:i + batch_size]
-                worker = ImageAnalysisWorker(batch, i // batch_size)
+                worker = ImageAnalysisWorker(batch, PREVIEW_WIDTH, PREVIEW_HEIGHT, batch_id=(i // batch_size))
                 
                 # Connect signals
                 worker.signals.result.connect(self.on_image_analyzed)
@@ -1078,25 +735,18 @@ class ImageSorterApp(QWidget):
         
         event.accept()
 
-def _pil_to_qicon(img: Image.Image) -> QIcon:
-    """Return a deep-copied QIcon from a resized PIL image."""
-    img = img.convert("RGB")
-    w, h = img.size
-    bytes_per_line = 3 * w
-    qimg = QImage(
-        img.tobytes(), w, h,
-        bytes_per_line,
-        QImage.Format.Format_RGB888
-    ).copy()                                      
-    pixmap = QPixmap.fromImage(qimg)              
-    return QIcon(pixmap)
-
 
 def main():
     """Main application entry point"""
+    logger.info("Starting Advanced Image Sorter v2.5")
     app = QApplication(sys.argv)
     app.setApplicationName("Advanced Image Sorter")
-    app.setApplicationVersion("2.0")
+    app.setApplicationVersion("2.5")
+    app.setStyle("windows11")
+    
+    # List available styles
+    # import PyQt6.QtWidgets as PyQt6QtWidgets
+    # print(PyQt6QtWidgets.QStyleFactory.keys())  
     
     # Set application icon if available
     try:
