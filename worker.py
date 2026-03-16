@@ -8,6 +8,10 @@ import time
 from imageMetrics import ImageMetrics
 from imageProcessor import ImageProcessor, _pil_to_qicon
 
+from logger import Logger
+from config import SORTING_CRITERIA
+
+logger = Logger()
 
 class WorkerSignals(QObject):
     """Enhanced worker signals with better progress tracking"""
@@ -21,6 +25,8 @@ class WorkerSignals(QObject):
 
 class ImageAnalysisWorker(QRunnable):
     """Optimized worker with better error handling and cancellation"""
+
+    global logger
 
     def __init__(self, paths: List[str], PREVIEW_WIDTH: int, PREVIEW_HEIGHT: int, batch_id: int = 0,):
         super().__init__()
