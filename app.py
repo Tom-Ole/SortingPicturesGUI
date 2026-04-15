@@ -351,7 +351,7 @@ class ImageSorterApp(QWidget):
 
     def setup_shortcuts(self):
         """Setup keyboard shortcuts"""
-        # Can be implemented later
+        # TODO
         pass
 
     def select_folder(self):
@@ -396,7 +396,7 @@ class ImageSorterApp(QWidget):
             self.pending_batches = (len(image_paths) + batch_size - 1) // batch_size
             self.completed_batches = 0
 
-            # Complete the load_images_from_folder method (continuation from line 450+)
+            # Complete the load_images_from_folder method
             for i in range(0, len(image_paths), batch_size):
                 batch = image_paths[i:i + batch_size]
                 worker = ImageAnalysisWorker(batch, PREVIEW_WIDTH, PREVIEW_HEIGHT, batch_id=(i // batch_size))
